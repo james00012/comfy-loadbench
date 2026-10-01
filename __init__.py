@@ -29,24 +29,27 @@ def _resolve(path):
     return path
 
 
-def _seq_read(path, chunk, limit):
+def _seq_read(path, chunk, limit, offset=0):
     got, t0 = 0, time.perf_counter()
-    with open(path, "rb", buffering=0) as f:
+    fd = os.open(path, os.O_RDONLY)
+    try:
         while got < limit:
-            b = f.read(min(chunk, limit - got))
+            b = os.pread(fd, min(chunk, limit - got), offset + got)
             if not b:
                 break
             got += len(b)
+    finally:
+        os.close(fd)
     return got, time.perf_counter() - t0
 
 
-def _threaded_read(path, nthreads, chunk, limit):
+def _threaded_read(path, nthreads, chunk, limit, offset=0):
     per = limit // nthreads
     counts = [0] * nthreads
 
     def work(i):
-        start = i * per
-        end = limit if i == nthreads - 1 else (i + 1) * per
+        start = offset + i * per
+        end = offset + (limit if i == nthreads - 1 else (i + 1) * per)
         fd = os.open(path, os.O_RDONLY)
         try:
             off, tot = start, 0
@@ -77,6 +80,8 @@ class LoadBench:
             "threads": ("INT", {"default": 8, "min": 1, "max": 64}),
             "chunk_mb": ("INT", {"default": 32, "min": 1, "max": 512}),
             "limit_gb": ("INT", {"default": 4, "min": 1, "max": 64}),
+            "offset_gb": ("INT", {"default": 0, "min": 0, "max": 60}),
+            "mode": (["seq", "threaded", "transfer", "library"],),
         }}
 
     RETURN_TYPES = ("STRING",)
@@ -88,10 +93,11 @@ class LoadBench:
     def IS_CHANGED(cls, **kw):
         return time.time()
 
-    def run(self, ckpt, threads, chunk_mb, limit_gb):
+    def run(self, ckpt, threads, chunk_mb, limit_gb, offset_gb=0, mode="seq"):
         path = _resolve(ckpt)
         chunk = chunk_mb * MB
         limit = limit_gb * 1024 * MB
+        offset = offset_gb * 1024 * MB
         out = ["path=%s" % path]
         print("LOADBENCH ==== start path=%s exists=%s size=%s"
               % (path, os.path.exists(path),
@@ -100,24 +106,33 @@ class LoadBench:
         if not os.path.exists(path):
             print("LOADBENCH ABORT file not found", flush=True)
             return ("missing",)
-        limit = min(limit, os.path.getsize(path))
+        limit = min(limit, os.path.getsize(path) - offset)
+        print("LOADBENCH mode=%s offset=%d limit=%d threads=%d"
+              % (mode, offset, limit, threads), flush=True)
 
-        # Storage: one thread, then many, then one again to show page cache.
-        for label, fn, arg in (("read_seq_cold", _seq_read, None),
-                               ("read_threaded", _threaded_read, threads),
-                               ("read_seq_warm", _seq_read, None)):
+        # One storage mode per job, at an offset nothing has read yet, so the
+        # page cache cannot flatter the second measurement.
+        if mode == "seq":
             try:
-                if arg is None:
-                    n, s = fn(path, chunk, limit)
-                else:
-                    n, s = fn(path, arg, chunk, limit)
-                out.append("%s=%.1f" % (label, _say(label, n, s,
-                           "threads=%s" % (arg or 1))))
+                n, s = _seq_read(path, chunk, limit, offset)
+                out.append("seq=%.1f" % _say("read_seq", n, s, "threads=1 off=%d" % offset))
             except Exception as e:
-                print("LOADBENCH %s FAILED %r" % (label, e), flush=True)
+                print("LOADBENCH read_seq FAILED %r" % (e,), flush=True)
+        if mode == "threaded":
+            try:
+                n, s = _threaded_read(path, threads, chunk, limit, offset)
+                out.append("threaded=%.1f" % _say("read_threaded", n, s,
+                           "threads=%d off=%d" % (threads, offset)))
+            except Exception as e:
+                print("LOADBENCH read_threaded FAILED %r" % (e,), flush=True)
+        if mode not in ("transfer", "library"):
+            print("LOADBENCH ==== done", flush=True)
+            return ("\n".join(out),)
 
         # Transfer: host to device, pageable against pinned.
         try:
+            if mode != "transfer":
+                raise StopIteration
             import torch
             if not torch.cuda.is_available():
                 print("LOADBENCH no cuda", flush=True)
@@ -156,11 +171,13 @@ class LoadBench:
                 torch.cuda.empty_cache()
             except Exception as e:
                 print("LOADBENCH cast FAILED %r" % (e,), flush=True)
+        except StopIteration:
+            pass
         except Exception as e:
             print("LOADBENCH transfer FAILED %r" % (e,), flush=True)
 
         # The library path, for reference against the raw numbers above.
-        for dev in ("cpu", "cuda"):
+        for dev in (("cpu", "cuda") if mode == "library" else ()):
             try:
                 from safetensors.torch import load_file
                 t0 = time.perf_counter()
