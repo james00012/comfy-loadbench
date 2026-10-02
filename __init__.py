@@ -72,6 +72,103 @@ def _threaded_read(path, nthreads, chunk, limit, offset=0):
     return sum(counts), time.perf_counter() - t0
 
 
+def _fadvise_read(path, nthreads, chunk, limit, offset=0):
+    """Ask the kernel to populate the cache, copying nothing into userspace."""
+    WILLNEED = getattr(os, "POSIX_FADV_WILLNEED", 3)
+    per = limit // nthreads
+    done = [0] * nthreads
+
+    def work(i):
+        start = offset + i * per
+        end = offset + (limit if i == nthreads - 1 else (i + 1) * per)
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            off, tot = start, 0
+            while off < end:
+                n = min(chunk, end - off)
+                os.posix_fadvise(fd, off, n, WILLNEED)
+                off += n
+                tot += n
+            done[i] = tot
+        finally:
+            os.close(fd)
+
+    ts = [threading.Thread(target=work, args=(i,)) for i in range(nthreads)]
+    t0 = time.perf_counter()
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return sum(done), time.perf_counter() - t0
+
+
+def _fadvise_then_verify(path, nthreads, chunk, limit, offset=0):
+    """fadvise, then read one byte a page to force the wait and prove it landed."""
+    n, s = _fadvise_read(path, nthreads, chunk, limit, offset)
+    t0 = time.perf_counter()
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        off = offset
+        step = 1 << 20
+        while off < offset + limit:
+            os.pread(fd, 1, off)
+            off += step
+    finally:
+        os.close(fd)
+    return n, s + (time.perf_counter() - t0)
+
+
+def _mmap_populate(path, nthreads, chunk, limit, offset=0):
+    """mmap the range and touch a byte a page, letting the kernel fault it in."""
+    import mmap as _mm
+    pagesz = os.sysconf("SC_PAGE_SIZE")
+    aligned = (offset // pagesz) * pagesz
+    length = limit + (offset - aligned)
+    fd = os.open(path, os.O_RDONLY)
+    t0 = time.perf_counter()
+    try:
+        mm = _mm.mmap(fd, length, prot=_mm.PROT_READ, offset=aligned)
+        try:
+            try:
+                mm.madvise(_mm.MADV_WILLNEED)
+            except Exception:
+                pass
+            total = 0
+            for p in range(0, length, pagesz):
+                total += mm[p]
+        finally:
+            mm.close()
+    finally:
+        os.close(fd)
+    return limit, time.perf_counter() - t0
+
+
+def _per_file_read(root, names, nthreads, chunk):
+    """One reader per file rather than ranges of one file."""
+    done = [0] * len(names)
+
+    def work(i, p):
+        fd = os.open(p, os.O_RDONLY)
+        try:
+            tot = 0
+            while True:
+                b = os.read(fd, chunk)
+                if not b:
+                    break
+                tot += len(b)
+            done[i] = tot
+        finally:
+            os.close(fd)
+
+    ts = [threading.Thread(target=work, args=(i, p)) for i, p in enumerate(names)]
+    t0 = time.perf_counter()
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return sum(done), time.perf_counter() - t0
+
+
 class LoadBench:
     @classmethod
     def INPUT_TYPES(cls):
@@ -81,7 +178,7 @@ class LoadBench:
             "chunk_mb": ("INT", {"default": 32, "min": 1, "max": 512}),
             "limit_gb": ("INT", {"default": 4, "min": 1, "max": 64}),
             "offset_gb": ("INT", {"default": 0, "min": 0, "max": 60}),
-            "mode": (["seq", "threaded", "transfer", "library"],),
+            "mode": (["seq", "threaded", "fadvise", "fadvise_verify", "mmap", "per_file", "transfer", "library"],),
         }}
 
     RETURN_TYPES = ("STRING",)
@@ -125,6 +222,45 @@ class LoadBench:
                            "threads=%d off=%d" % (threads, offset)))
             except Exception as e:
                 print("LOADBENCH read_threaded FAILED %r" % (e,), flush=True)
+        if mode == "fadvise":
+            try:
+                n, s = _fadvise_read(path, threads, chunk, limit, offset)
+                out.append("fadvise=%.1f" % _say("read_fadvise", n, s,
+                           "threads=%d off=%d" % (threads, offset)))
+            except Exception as e:
+                print("LOADBENCH read_fadvise FAILED %r" % (e,), flush=True)
+        if mode == "fadvise_verify":
+            try:
+                n, s = _fadvise_then_verify(path, threads, chunk, limit, offset)
+                out.append("fadvise_verify=%.1f" % _say("read_fadvise_verify", n, s,
+                           "threads=%d off=%d" % (threads, offset)))
+            except Exception as e:
+                print("LOADBENCH read_fadvise_verify FAILED %r" % (e,), flush=True)
+        if mode == "mmap":
+            try:
+                n, s = _mmap_populate(path, threads, chunk, limit, offset)
+                out.append("mmap=%.1f" % _say("read_mmap", n, s, "off=%d" % offset))
+            except Exception as e:
+                print("LOADBENCH read_mmap FAILED %r" % (e,), flush=True)
+        if mode == "per_file":
+            try:
+                import json as _j
+                names = []
+                raw = os.environ.get("COMFY_DEPLOY_MODELS", "[]")
+                vol = os.environ.get("COMFY_DEPLOY_VOLUME", "/runpod-volume")
+                for m in _j.loads(raw):
+                    if isinstance(m, dict) and m.get("Filename"):
+                        p = os.path.join(vol, "models", m.get("Type") or "", m["Filename"])
+                        if os.path.exists(p):
+                            names.append(p)
+                if not names:
+                    print("LOADBENCH per_file: no models in the manifest", flush=True)
+                else:
+                    n, s = _per_file_read(None, names, threads, chunk)
+                    out.append("per_file=%.1f" % _say("read_per_file", n, s,
+                               "files=%d" % len(names)))
+            except Exception as e:
+                print("LOADBENCH read_per_file FAILED %r" % (e,), flush=True)
         if mode not in ("transfer", "library"):
             print("LOADBENCH ==== done", flush=True)
             return ("\n".join(out),)
