@@ -109,8 +109,9 @@ def _fadvise_then_verify(path, nthreads, chunk, limit, offset=0):
     fd = os.open(path, os.O_RDONLY)
     try:
         off = offset
-        step = 1 << 20
-        while off < offset + limit:
+        step = os.sysconf("SC_PAGE_SIZE")
+        end = offset + limit
+        while off < end:
             os.pread(fd, 1, off)
             off += step
     finally:
